@@ -67,7 +67,8 @@ needs; there are no other dependencies. Running the same command again updates i
 
 ## Use
 
-Open `http://<analyzer-address>:8080/` or `http://<name>.local:8080/`.
+Open `http://<analyzer-address>/` or `http://<name>.local/` (port 80; port 8080 serves the
+same page, and is where fReqon and the SoundBase plugin probe `/harogic-info`).
 
 1. **First visit:** set the page password (8 characters or more). Do this yourself before
    handing the unit to anyone: until it is set, whoever opens the page first chooses it.
@@ -79,11 +80,15 @@ Open `http://<analyzer-address>:8080/` or `http://<name>.local:8080/`.
 From fReqon, the Connection dialog's **Settings page** buttons open it, also from another
 subnet.
 
+**Changing the page password:** the *Page password* card at the bottom of the page asks for
+the current password and the new one twice; the browser asks for the new one straight away.
+
 ## Maintenance (over SSH, on the analyzer)
 
 | Task | Command |
 |---|---|
-| Forgotten page password | `sudo python3 /opt/harogic-netconfig/netconfig.py --reset-password` (the next visit sets a new one) |
+| Forgotten page password | `sudo python3 /opt/harogic-netconfig/netconfig.py --reset-password` (the next visit sets a new one; a known password is changed on the page itself) |
+| Serve on other ports | `NETCONFIG_PORT=80,8080` in the service's environment (the first port is the one the page's links use) |
 | Service log | `sudo cat /var/lib/harogic-netconfig/netconfig.log` or `journalctl -u harogic-netconfig` |
 | Remove it | `sudo sh /opt/harogic-netconfig/uninstall.sh` (the analyzer keeps whatever setting it has) |
 

@@ -1,5 +1,5 @@
 [Unit]
-Description=Analyzer network settings page (port 8080)
+Description=Analyzer network settings page (ports 80 and 8080)
 After=network-online.target NetworkManager.service
 Wants=network-online.target
 

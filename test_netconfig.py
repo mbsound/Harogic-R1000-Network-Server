@@ -32,9 +32,9 @@ ORIGINAL = {"dhcp_enabled": True, "static_cidr": "192.168.1.100/24", "static_gat
             "dhcp_probe_fail_max": 5, "dhcp_wait_seconds": 8, "nmcli_up_timeout_seconds": 3}
 
 
-def start(tmp, port, confirm_s=3):
+def start(tmp, port, ports=None):
     env = dict(os.environ, NETCONFIG_IP_CONFIG=os.path.join(tmp, "ip.config"), NETCONFIG_STATE_DIR=os.path.join(tmp, "state"),
-               NETCONFIG_PORT=str(port), NETCONFIG_DRY_RUN="1", NETCONFIG_CONFIRM_SECONDS=str(confirm_s),
+               NETCONFIG_PORT=ports or str(port), NETCONFIG_DRY_RUN="1",
                NETCONFIG_APPLY_DELAY="0.2", NETCONFIG_DEVICE_ID=os.path.join(tmp, "device_id.conf"), NETCONFIG_IFACE="lo0",
                NETCONFIG_AVAHI_CONF=os.path.join(tmp, "avahi-daemon.conf"), NETCONFIG_RELAY="")
     p = subprocess.Popen([sys.executable, os.path.join(HERE, "netconfig.py")], env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
@@ -137,27 +137,22 @@ def main():
         assert c["dhcp_enabled"] is False and c["static_cidr"] == "192.168.1.101/24"
         assert c["static_gateway_enabled"] is True and c["static_gateway_address"] == "192.168.1.1"
         assert c["dns"] == ["192.168.1.1", "8.8.8.8"] and c["dhcp_probe_interval_seconds"] == 12
-        assert "waiting for confirmation" in get(port, "goodpass1")[1]
-        # ... not kept in time: it goes back by itself
-        time.sleep(4.5)
-        assert config(tmp) == ORIGINAL, config(tmp)
-        assert "waiting for confirmation" not in get(port, "goodpass1")[1]
-        print("ok  unconfirmed change goes back by itself")
+        # Applied at once and kept: no confirmation to give from the new address
+        time.sleep(1.0)
+        assert config(tmp)["static_cidr"] == "192.168.1.101/24"
+        print("ok  a change is applied at once and kept")
 
-        # Kept: stays
+        # The page asks "are you sure?" before Apply, and offers the replaced setting back
+        code, body = get(port, "goodpass1")
+        assert 'onsubmit="return confirmApply(this)"' in body and "confirm(" in body
+        assert "Previous setting" in body and "DHCP (falls back to 192.168.1.100/24" in body, body[-1500:]
         post(port, "/apply", {"t": t, "mode": "dhcp", "ip": "192.168.50.20", "prefix": "24"}, "goodpass1")
-        assert post(port, "/confirm", {"t": t}, "goodpass1")[0] == 200
-        time.sleep(4.5)
         c = config(tmp)
         assert c["dhcp_enabled"] is True and c["static_cidr"] == "192.168.50.20/24" and c["static_gateway_enabled"] is False
-        print("ok  confirmed change stays (DHCP with a fallback address)")
-
-        # Undo now
-        post(port, "/apply", {"t": t, "mode": "static", "ip": "10.0.0.5", "prefix": "8"}, "goodpass1")
-        post(port, "/revert", {"t": t}, "goodpass1")
-        time.sleep(0.5)
-        assert config(tmp)["static_cidr"] == "192.168.50.20/24"
-        print("ok  undo returns to the last kept setting")
+        code, body = post(port, "/previous", {"t": t}, "goodpass1")
+        assert code == 200 and "Previous setting restored" in body and "Static 192.168.1.101/24, gateway 192.168.1.1" in body
+        assert config(tmp)["static_cidr"] == "192.168.1.101/24" and config(tmp)["dhcp_enabled"] is False
+        print("ok  are-you-sure on Apply; previous setting restored")
 
         # The name on the network: only avahi's host-name changes, the rest of its file stays
         avahi = os.path.join(tmp, "avahi-daemon.conf")
@@ -176,6 +171,19 @@ def main():
         assert open(avahi).read() == AVAHI
         print("ok  network name set, refused when invalid, factory name restored")
 
+        # The page password is changed from the page; the old one stops working at once
+        assert post(port, "/password", {"t": t, "current": "goodpass1", "p1": "newpass99", "p2": "newpass99"})[0] == 401
+        code, body = post(port, "/password", {"t": t, "current": "wrong", "p1": "newpass99", "p2": "newpass99"}, "goodpass1")
+        assert code == 200 and "current password is wrong" in body
+        assert "at least 8" in post(port, "/password", {"t": t, "current": "goodpass1", "p1": "short", "p2": "short"}, "goodpass1")[1]
+        assert "differ" in post(port, "/password", {"t": t, "current": "goodpass1", "p1": "newpass99", "p2": "newpass98"}, "goodpass1")[1]
+        assert config(tmp)["static_cidr"] == "192.168.1.101/24"
+        code, body = post(port, "/password", {"t": t, "current": "goodpass1", "p1": "newpass99", "p2": "newpass99"}, "goodpass1")
+        assert code == 200 and "Password changed" in body
+        assert get(port, "goodpass1")[0] == 401 and get(port, "newpass99")[0] == 200
+        assert "Change password" in get(port, "newpass99")[1]
+        print("ok  page password changed from the page")
+
         # What the unit is, without the password, on IPv4 and IPv6
         info = json.loads(urllib.request.urlopen(f"http://127.0.0.1:{port}/harogic-info", timeout=5).read())
         assert info["harogic"] is True and info["device_id"] == "67-example" and info["name"] == "67-example"
@@ -183,19 +191,41 @@ def main():
         assert info6 == info
         print("ok  /harogic-info on IPv4 and IPv6")
 
-        # A restart with a change never confirmed puts the last kept one back
-        post(port, "/apply", {"t": t, "mode": "static", "ip": "10.0.0.6", "prefix": "8"}, "goodpass1")
+        # A restart leaves the setting as it is (no undo of anything)
         srv.terminate(); srv.wait()
-        srv = start(tmp, port, confirm_s=60)
+        srv = start(tmp, port)
         time.sleep(1.0)
-        assert config(tmp)["static_cidr"] == "192.168.50.20/24", config(tmp)
-        print("ok  restart before confirming goes back")
+        assert config(tmp)["static_cidr"] == "192.168.1.101/24"
+        print("ok  a restart changes nothing")
     finally:
         srv.terminate()
         srv.wait()
         out = srv.stdout.read().decode()
     print("log tail:", " | ".join(out.strip().splitlines()[-3:]))
     print("All netconfig tests passed.")
+
+
+def test_ports():
+    """The page is served on every listed port (80 and 8080 by default); links use the first."""
+    sys.path.insert(0, HERE)
+    import netconfig
+    assert netconfig.PORTS == [80, 8080] and netconfig.url_port() == "", (netconfig.PORTS, netconfig.url_port())
+    tmp = tempfile.mkdtemp()
+    with open(os.path.join(tmp, "ip.config"), "w") as f:
+        json.dump(ORIGINAL, f)
+    with open(os.path.join(tmp, "device_id.conf"), "w") as f:
+        f.write("67-example\n")
+    with open(os.path.join(tmp, "avahi-daemon.conf"), "w") as f:
+        f.write(AVAHI)
+    srv = start(tmp, 18090, ports="18090,18091")
+    try:
+        for port in (18090, 18091):
+            info = json.loads(urllib.request.urlopen(f"http://127.0.0.1:{port}/harogic-info", timeout=5).read())
+            assert info["device_id"] == "67-example", port
+            assert get(port)[0] == 200 and "Set a password" in get(port)[1]
+        print("ok  the page is served on both listed ports")
+    finally:
+        srv.terminate(); srv.wait()
 
 
 def test_relay():
@@ -234,5 +264,6 @@ def test_relay():
 
 if __name__ == "__main__":
     main()
+    test_ports()
     test_relay()
     print("All netconfig tests passed (relay included).")

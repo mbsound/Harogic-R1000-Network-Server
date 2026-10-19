@@ -12,7 +12,7 @@ systemctl enable harogic-netconfig.service >/dev/null 2>&1
 systemctl restart harogic-netconfig.service
 sleep 2
 if systemctl is-active --quiet harogic-netconfig.service; then
-    echo "Installed and running. Open http://$(hostname -I | awk '{print $1}'):8080/ (or http://<name>.local:8080/)."
+    echo "Installed and running. Open http://$(hostname -I | awk '{print $1}')/ (or http://<name>.local/; port 8080 still works)."
     [ -f /var/lib/harogic-netconfig/auth.json ] || echo "First visit: you will be asked to set the page password."
 else
     echo "The service did not start:"; journalctl -u harogic-netconfig.service -n 20 --no-pager

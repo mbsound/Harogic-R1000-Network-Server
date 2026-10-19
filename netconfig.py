@@ -16,9 +16,8 @@ SDK server listens on IPv4 only, so this service relays IPv6 connections on its 
 (RELAY), and answers on IPv6 itself. fReqon uses that when the analyzer's IPv4 address is not
 on any of the computer's networks. GET /harogic-info (no password) says what the unit is.
 
-Safety: a change that leaves the page unreachable undoes itself. After an address change
-the new address has to be opened and "Keep" pressed within CONFIRM_SECONDS, or the previous
-setting is put back.
+Applying a change asks "are you sure?" first (in the browser), then takes effect at once and
+stays. The setting it replaced is kept, and "Restore previous setting" puts it back.
 
 Standard library only (Python 3.9+). Runs as root (Net.sh must), from a systemd unit.
 Settings for testing come from environment variables (see the CONFIG section).
@@ -49,9 +48,17 @@ NET_SH = os.environ.get("NETCONFIG_NET_SH", "/opt/Function/Net/Net.sh")
 DEVICE_ID_FILE = os.environ.get("NETCONFIG_DEVICE_ID", "/etc/device/device_id.conf")
 AVAHI_CONF = os.environ.get("NETCONFIG_AVAHI_CONF", "/etc/avahi/avahi-daemon.conf")
 STATE_DIR = os.environ.get("NETCONFIG_STATE_DIR", "/var/lib/harogic-netconfig")
-PORT = int(os.environ.get("NETCONFIG_PORT", "8080"))
+# The page is on port 80 (http://<address>/, no port to remember) and on 8080
+# (where fReqon and the SoundBase plugin probe /harogic-info). NETCONFIG_PORT
+# lists the ports; the first is the one the page's own links use.
+PORTS = [int(x) for x in os.environ.get("NETCONFIG_PORT", "80,8080").split(",") if x.strip()]
+PORT = PORTS[0]
+
+
+def url_port():
+    """':8080' for a link, or '' on port 80."""
+    return "" if PORT == 80 else f":{PORT}"
 DRY_RUN = os.environ.get("NETCONFIG_DRY_RUN") == "1"     # never run Net.sh or touch the interface
-CONFIRM_SECONDS = int(os.environ.get("NETCONFIG_CONFIRM_SECONDS", "120"))
 APPLY_DELAY_S = float(os.environ.get("NETCONFIG_APPLY_DELAY", "2"))   # the answer reaches the browser first
 OWNER = os.environ.get("NETCONFIG_OWNER", "htra")        # ip.config belongs to this user
 # IPv6 port -> IPv4 address:port it is relayed to ("" for none)
@@ -282,68 +289,40 @@ def parse_form(form, current):
     return new, errors
 
 
-# --- Pending change and its automatic undo ---------------------------------------------
-def pending():
+# --- Applying a change, and putting the previous one back -------------------------------------
+def previous():
+    """The setting the last change replaced, or None."""
     try:
-        with open(PENDING_FILE) as f:
-            return json.load(f)
+        with open(PREV_FILE) as f:
+            prev = json.load(f)
+        return prev if isinstance(prev, dict) else None
     except (OSError, ValueError):
         return None
 
 
-def apply_change(new_cfg):
+def apply_change(new_cfg, why="changed from the page"):
+    """Write the new setting (keeping the one it replaces) and apply it with Net.sh."""
     with _lock:
         os.makedirs(STATE_DIR, exist_ok=True)
         prev_text = open(IP_CONFIG).read() if os.path.exists(IP_CONFIG) else json.dumps(DEFAULTS, indent=2)
-        if not pending():                       # keep the last setting known to work, not a half-tried one
-            with open(PREV_FILE, "w") as f:
-                f.write(prev_text)
+        with open(PREV_FILE, "w") as f:
+            f.write(prev_text)
         write_config(new_cfg)
-        p = {"deadline": time.time() + CONFIRM_SECONDS + APPLY_DELAY_S, "config": new_cfg}
-        with open(PENDING_FILE, "w") as f:
-            json.dump(p, f)
-        log(f"change written: dhcp={new_cfg['dhcp_enabled']} static={new_cfg['static_cidr']} "
+        log(f"{why}: dhcp={new_cfg['dhcp_enabled']} static={new_cfg['static_cidr']} "
             f"gateway={new_cfg['static_gateway_address'] if new_cfg['static_gateway_enabled'] else 'none'} dns={new_cfg['dns']}")
 
     def later():
-        time.sleep(APPLY_DELAY_S)
+        time.sleep(APPLY_DELAY_S)          # the answer reaches the browser first
         run_net_sh()
-        watch_pending()
     threading.Thread(target=later, daemon=True).start()
 
 
-def watch_pending():
-    """Undo the change if nobody confirms it in time."""
-    p = pending()
-    while p:
-        left = p["deadline"] - time.time()
-        if left <= 0:
-            revert("not confirmed in time")
-            return
-        time.sleep(min(left, 2))
-        p = pending()
-
-
-def revert(why):
-    with _lock:
-        if not pending():
-            return
-        try:
-            with open(PREV_FILE) as f:
-                prev = json.load(f)
-            write_config(prev)
-            log(f"reverted ({why}): back to dhcp={prev.get('dhcp_enabled')} static={prev.get('static_cidr')}")
-        except (OSError, ValueError) as e:
-            log(f"revert failed, no previous setting: {e}")
-        os.remove(PENDING_FILE)
-    threading.Thread(target=run_net_sh, daemon=True).start()
-
-
-def confirm():
-    with _lock:
-        if pending():
-            os.remove(PENDING_FILE)
-            log("change kept")
+def summary(cfg):
+    """One line for a setting, as the page shows it."""
+    if cfg.get("dhcp_enabled"):
+        return f"DHCP (falls back to {cfg.get('static_cidr')} when no DHCP server answers)"
+    gw = f", gateway {cfg['static_gateway_address']}" if cfg.get("static_gateway_enabled") else ""
+    return f"Static {cfg.get('static_cidr')}{gw}"
 
 
 # --- Page password -----------------------------------------------------------------------
@@ -404,16 +383,16 @@ def e(x):
 
 def links_for(cfg, st):
     """Where the page will be after the change."""
-    host = f"http://{e(st['hostname'])}.local:{PORT}/"
+    host = f"http://{e(st['hostname'])}.local{url_port()}/"
     if cfg["dhcp_enabled"]:
         return (f"<a href='{host}'>{host}</a> (the network's DHCP server picks the address; if none answers, "
-                f"<a href='http://{e(cfg['static_cidr'].split('/')[0])}:{PORT}/'>http://{e(cfg['static_cidr'].split('/')[0])}:{PORT}/</a>)")
+                f"<a href='http://{e(cfg['static_cidr'].split('/')[0])}{url_port()}/'>http://{e(cfg['static_cidr'].split('/')[0])}{url_port()}/</a>)")
     ip = cfg["static_cidr"].split("/")[0]
-    return f"<a href='http://{e(ip)}:{PORT}/'>http://{e(ip)}:{PORT}/</a> or <a href='{host}'>{host}</a>"
+    return f"<a href='http://{e(ip)}{url_port()}/'>http://{e(ip)}{url_port()}/</a> or <a href='{host}'>{host}</a>"
 
 
-def main_page(errors=(), form=None, notice="", name_value=None):
-    cfg, st, p = read_config(), live_status(), pending()
+def main_page(errors=(), form=None, notice="", name_value=None, password_errors=()):
+    cfg, st, prev = read_config(), live_status(), previous()
     ip, prefix = cfg["static_cidr"].split("/")
     gw = cfg["static_gateway_address"] if cfg["static_gateway_enabled"] else ""
     dns = " ".join(cfg.get("dns") or [])
@@ -422,13 +401,6 @@ def main_page(errors=(), form=None, notice="", name_value=None):
         mode, ip, prefix, gw, dns = (form.get("mode", mode), form.get("ip", ip), form.get("prefix", prefix),
                                      form.get("gateway", gw), form.get("dns", dns))
     body = [f"<h1>Analyzer network</h1><p class=sub>{e(st['hostname'])} &middot; MAC {e(st['mac'] or '?')}</p>"]
-    if p:
-        left = max(0, int(p["deadline"] - time.time()))
-        body.append(f"<div class='card banner'><h2>Change waiting for confirmation</h2><p><b>{left} s left.</b> "
-                    f"If this page loaded at the new address, the change works: keep it. Otherwise it goes back "
-                    f"to the previous setting by itself.</p><form method=post action=/confirm><input type=hidden name=t value={CSRF_TOKEN}>"
-                    f"<button>Keep this setting</button></form><form method=post action=/revert><input type=hidden name=t value={CSRF_TOKEN}>"
-                    f"<button class=secondary>Undo now</button></form></div>")
     body.append("<div class=card><h2>Now</h2><dl>"
                 f"<dt>Address</dt><dd>{e(', '.join(st['addresses']) or 'none')}</dd>"
                 f"<dt>Obtained by</dt><dd>{'DHCP' if st['dhcp'] else 'static setting'}</dd>"
@@ -439,7 +411,7 @@ def main_page(errors=(), form=None, notice="", name_value=None):
     if notice:
         body.append(f"<div class='card banner'>{notice}</div>")
     chk = lambda m: "checked" if mode == m else ""
-    body.append(f"""<form class=card method=post action=/apply><h2>Setting</h2><input type=hidden name=t value={CSRF_TOKEN}>
+    body.append(f"""<form class=card method=post action=/apply onsubmit="return confirmApply(this)"><h2>Setting</h2><input type=hidden name=t value={CSRF_TOKEN}>
 <div class=modes><label><input type=radio name=mode value=static {chk('static')} onchange=sync()><span>Static</span></label>
 <label><input type=radio name=mode value=dhcp {chk('dhcp')} onchange=sync()><span>DHCP</span></label></div>
 <p class=note id=modenote></p>
@@ -448,18 +420,48 @@ def main_page(errors=(), form=None, notice="", name_value=None):
 <label for=gateway>Gateway (optional)</label><input type=text id=gateway name=gateway value="{e(gw)}" placeholder="none: the analyzer is only reached on this network">
 <label for=dns>DNS servers (optional)</label><input type=text id=dns name=dns value="{e(dns)}" placeholder="e.g. 192.168.1.1 8.8.8.8">
 <button>Apply</button>
-<p class=note>Prefix 24 means 255.255.255.0. After Apply, open the analyzer at its new address and press <b>Keep</b>
-within {CONFIRM_SECONDS // 60} minutes; if that does not happen, it returns to the current setting by itself.</p></form>
+<p class=note>Prefix 24 means 255.255.255.0. You are asked to confirm before anything changes. Programs connected to
+the analyzer by its address lose it when the address changes; by its name (<code>{e(st['hostname'])}.local</code>) they find it
+again, and fReqon reaches it by name from any subnet on the same cable.</p></form>
+{previous_card(prev, cfg)}
 <form class=card method=post action=/rename><h2>Name on the network</h2><input type=hidden name=t value={CSRF_TOKEN}>
 <label for=name>Name (reached as <code>name.local</code>)</label><input type=text id=name name=name value="{e(name_value if name_value is not None else st['hostname'])}" required>
 <button>Save name</button>
 <p class=note>Letters, digits and hyphens. Changing it does not change the address, so nothing is lost if the name is not found;
 programs that saved the old name (fReqon's Connection dialog, for one) need the new one. Factory name: <code>{e(device_id())}</code>.</p>
 <button class=secondary name=factory value=1>Restore factory name</button></form>
-<script>function sync(){{var d=document.querySelector('input[value=dhcp]').checked;
+{password_card(password_errors)}
+<script>
+function confirmApply(f){{
+  var d=f.querySelector('input[value=dhcp]').checked, ip=f.ip.value.trim(), pf=f.prefix.value.trim(), gw=f.gateway.value.trim();
+  var what=d?('DHCP, falling back to '+ip+'/'+pf+' when no DHCP server answers'):('Static '+ip+'/'+pf+(gw?', gateway '+gw:''));
+  return confirm('Change the analyzer\'s network setting to '+what+'?\n\nAnything connected to it at its current '+
+    'address will lose it. The analyzer keeps this setting through restarts; Restore previous setting puts the current one back.');
+}}
+function sync(){{var d=document.querySelector('input[value=dhcp]').checked;
 document.getElementById('iplabel').textContent=d?'Fallback address (used when no DHCP server answers)':'Address';
 document.getElementById('modenote').textContent=d?'The network\\'s DHCP server assigns the address. If none answers within a few seconds, the analyzer uses the fallback address below, and keeps looking for a DHCP server.':'The analyzer always uses this address.';}}sync();</script>""")
     return page("Analyzer network", "".join(body))
+
+
+def password_card(errors=()):
+    err = "<div class=err><b>Not changed:</b><ul>" + "".join(f"<li>{e(x)}</li>" for x in errors) + "</ul></div>" if errors else ""
+    return f"""<form class=card method=post action=/password><h2>Page password</h2><input type=hidden name=t value={CSRF_TOKEN}>{err}
+<label for=current>Current password</label><input type=password id=current name=current autocomplete=current-password required>
+<label for=p1>New password (at least 8 characters)</label><input type=password id=p1 name=p1 autocomplete=new-password required>
+<label for=p2>New password again</label><input type=password id=p2 name=p2 autocomplete=new-password required>
+<button class=secondary>Change password</button>
+<p class=note>The browser asks for the new password straight away. Forgotten it? On the analyzer:
+<code>sudo python3 /opt/harogic-netconfig/netconfig.py --reset-password</code>, then the next visit sets a new one.</p></form>"""
+
+
+def previous_card(prev, cfg):
+    """A way back to the setting the last change replaced, if there is one."""
+    if not prev or summary(prev) == summary(cfg):
+        return ""
+    return (f"<form class=card method=post action=/previous onsubmit=\"return confirm('Go back to: {e(summary(prev))}?')\">"
+            f"<h2>Previous setting</h2><input type=hidden name=t value={CSRF_TOKEN}><p>{e(summary(prev))}</p>"
+            f"<button class=secondary>Restore previous setting</button></form>")
 
 
 def setup_page(error=""):
@@ -632,11 +634,10 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(main_page(["That is the setting it already has."], form))
                 return
             apply_change(new)
-            self._send(page("Applying", f"""<h1>Applying the new setting</h1>
-<div class='card banner'><p>In a few seconds the analyzer moves. Open it at {links_for(new, live_status())}
-and press <b>Keep this setting</b> within {CONFIRM_SECONDS // 60} minutes.</p>
-<p>If you cannot reach it there, do nothing: after {CONFIRM_SECONDS // 60} minutes it goes back to its previous setting and this page
-comes back at the old address. Your computer may also need an address on the new network to reach it.</p></div>"""))
+            self._send(page("Applied", f"""<h1>New setting applied</h1>
+<div class='card banner'><p>{e(summary(new))}. The analyzer moves in a few seconds and keeps this setting through restarts.</p>
+<p>Open it at {links_for(new, live_status())}. A computer on another network needs an address on the new one,
+or fReqon (which reaches it by name over the cable).</p></div><p><a href=/>Back to the page</a></p>"""))
         elif self.path == "/rename":
             name, err = check_name(device_id() if form.get("factory") else form.get("name", ""))
             if err:
@@ -647,32 +648,66 @@ comes back at the old address. Your computer may also need an address on the new
                 return
             set_mdns_name(name)
             ip = (live_status()["addresses"] or ["?"])[0].split("/")[0]
-            self._send(main_page(notice=f"<p>Now reached as <a href='http://{e(name)}.local:{PORT}/'>http://{e(name)}.local:{PORT}/</a> "
-                                        f"(and still at <a href='http://{e(ip)}:{PORT}/'>http://{e(ip)}:{PORT}/</a>). "
+            self._send(main_page(notice=f"<p>Now reached as <a href='http://{e(name)}.local{url_port()}/'>http://{e(name)}.local{url_port()}/</a> "
+                                        f"(and still at <a href='http://{e(ip)}{url_port()}/'>http://{e(ip)}{url_port()}/</a>). "
                                         f"Computers may take a few seconds to find the new name.</p>"))
-        elif self.path == "/confirm":
-            confirm()
-            self._send(page("Kept", "<h1>Setting kept</h1><p>The analyzer keeps this setting from now on, through restarts.</p><p><a href=/>Back</a></p>"))
-        elif self.path == "/revert":
-            revert("undone from the page")
-            self._send(page("Undoing", "<h1>Going back to the previous setting</h1><p>The analyzer returns to its previous address in a few seconds.</p>"))
+        elif self.path == "/password":
+            errors = []
+            if not check_password(form.get("current", "")):
+                time.sleep(1.0)
+                errors.append("The current password is wrong.")
+            if len(form.get("p1", "")) < 8:
+                errors.append("The new password needs at least 8 characters.")
+            elif form.get("p1") != form.get("p2"):
+                errors.append("The two new passwords differ.")
+            if errors:
+                self._send(main_page(password_errors=errors))
+                return
+            set_password(form["p1"])
+            log("page password changed")
+            # the browser still holds the old password: the next request is a 401
+            # and it asks for the new one
+            self._send(page("Password changed", """<h1>Password changed</h1>
+<p><a href=/>Back to the page</a> (the browser asks for the new password).</p>"""))
+        elif self.path == "/previous":
+            prev = previous()
+            if not prev:
+                self._send(main_page(["There is no previous setting to go back to."]))
+                return
+            apply_change(prev, "previous setting restored")
+            self._send(page("Restored", f"""<h1>Previous setting restored</h1>
+<div class='card banner'><p>{e(summary(prev))}. The analyzer moves in a few seconds.</p>
+<p>Open it at {links_for(prev, live_status())}.</p></div><p><a href=/>Back to the page</a></p>"""))
         else:
             self._send(page("Not found", "<h1>Not found</h1>"), 404)
 
 
 def main():
     os.makedirs(STATE_DIR, exist_ok=True)
-    if pending():
-        # Restarted with a change never confirmed (power cut, crash): back to what worked
-        threading.Thread(target=lambda: revert("service restarted before the change was confirmed"), daemon=True).start()
-    start_relays()
     try:
-        srv = DualStackServer(("::", PORT), Handler)
+        os.remove(PENDING_FILE)            # left by an older version that undid unconfirmed changes
     except OSError:
-        srv = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)     # no IPv6 here: IPv4 only
-    log(f"listening on port {PORT} for {IFACE}; config {IP_CONFIG}{' (dry run)' if DRY_RUN else ''}")
+        pass
+    start_relays()
+    servers = []
+    for port in PORTS:
+        try:
+            srv = DualStackServer(("::", port), Handler)
+        except OSError:
+            try:
+                srv = ThreadingHTTPServer(("0.0.0.0", port), Handler)     # no IPv6 here: IPv4 only
+            except OSError as err:
+                log(f"port {port} not available ({err}); the page is not served there")
+                continue
+        servers.append(srv)
+        log(f"listening on port {port} for {IFACE}; config {IP_CONFIG}{' (dry run)' if DRY_RUN else ''}")
+    if not servers:
+        log("no port to serve the page on; giving up")
+        sys.exit(1)
+    for srv in servers[1:]:
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
     try:
-        srv.serve_forever()
+        servers[0].serve_forever()
     except KeyboardInterrupt:
         pass
 
